@@ -10,6 +10,7 @@ import random
 import threading
 import time
 from collections import defaultdict
+from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -55,6 +56,9 @@ TARGET_TIMEOUT_SECONDS = 6.0
 MIN_EYE_OPEN_RATIO = 0.075
 MAX_IRIS_STEP = 0.090
 MAX_HEAD_MOTION = 0.25
+STABILITY_WINDOW = 6
+MAX_STABLE_SPREAD_H = 0.018
+MAX_STABLE_SPREAD_V = 0.014
 BROWSER_SETTLE_SECONDS = 0.30
 DEFAULT_OVERLAY_PORT = 8765
 
@@ -323,6 +327,7 @@ def main():
             t0 = time.time()
             trial_target_set = False
             phase = "paused"
+            stable_buf = deque(maxlen=STABILITY_WINDOW)
 
             while True:
                 elapsed = time.time() - t0
@@ -406,10 +411,19 @@ def main():
                         iris_step = float(np.hypot(h - prev_h, v - prev_v))
                     prev_h = h
                     prev_v = v
+                    stable_buf.append((float(h), float(v)))
+                    spread_h = 1.0
+                    spread_v = 1.0
+                    if len(stable_buf) >= STABILITY_WINDOW:
+                        arr = np.asarray(stable_buf, dtype=float)
+                        spread_h = float(np.max(arr[:, 0]) - np.min(arr[:, 0]))
+                        spread_v = float(np.max(arr[:, 1]) - np.min(arr[:, 1]))
                     quality_ok = (
                         eye_open >= MIN_EYE_OPEN_RATIO
                         and head_motion <= MAX_HEAD_MOTION
                         and iris_step <= MAX_IRIS_STEP
+                        and spread_h <= MAX_STABLE_SPREAD_H
+                        and spread_v <= MAX_STABLE_SPREAD_V
                     )
                     if quality_ok:
                         if settled_since is None:

@@ -42,6 +42,7 @@ I3_FOCUS_APP_IDS = (
 DEFAULT_SESSION_URL = "https://en.wikipedia.org/wiki/Eye_tracking"
 DEFAULT_SESSION_MIN_TABS = 3
 DEFAULT_SESSION_MAX_TABS = 20
+EPS = 1e-8
 
 
 def chromium_browser_binary():
@@ -237,6 +238,64 @@ def focus_managed_chromium_session(session):
     return False, "Could not activate managed browser window."
 
 
+def _weighted_ridge_fit(X, y, weights, ridge_diag):
+    """Solve weighted ridge regression with small numeric guards."""
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    w = np.clip(w, 1e-4, None)
+    if X.ndim != 2 or y.ndim != 1 or len(X) != len(y) or len(w) != len(y):
+        return None
+    sw = np.sqrt(w).reshape(-1, 1)
+    Xw = X * sw
+    yw = y * sw.reshape(-1)
+    ridge = np.diag(np.asarray(ridge_diag, dtype=float))
+    return np.linalg.pinv(Xw.T @ Xw + ridge) @ (Xw.T @ yw)
+
+
+def _predict_pos_linear(model, h, v):
+    pm = model.get("position_model") or {}
+    weights = np.asarray(pm.get("weights", []), dtype=float)
+    if weights.shape != (3,):
+        return None
+    x = np.asarray([1.0, float(h), float(v)], dtype=float)
+    return float(np.clip(float(x @ weights), 0.0, 1.0))
+
+
+def _predict_pos_axis(model, h, v):
+    am = model.get("axis_model") or {}
+    direction = np.asarray(am.get("direction", []), dtype=float)
+    center = np.asarray(am.get("center", []), dtype=float)
+    weights = np.asarray(am.get("weights", []), dtype=float)
+    if direction.shape != (2,) or center.shape != (2,) or weights.shape != (2,):
+        return None
+    x = np.asarray([float(h), float(v)], dtype=float)
+    proj = float((x - center).T @ direction)
+    pos = float(weights[0] + weights[1] * proj)
+    return float(np.clip(pos, 0.0, 1.0))
+
+
+def _combined_position(model, h, v):
+    """Blend available position estimators; prefer lower-error models."""
+    p_linear = _predict_pos_linear(model, h, v)
+    p_axis = _predict_pos_axis(model, h, v)
+    if p_linear is None:
+        return p_axis, None
+    if p_axis is None:
+        return p_linear, None
+    lin_rmse = float((model.get("position_model") or {}).get("rmse", 0.12))
+    axis_rmse = float((model.get("axis_model") or {}).get("rmse", 0.12))
+    lin_w = 1.0 / max(lin_rmse**2, 1e-5)
+    axis_w = 1.0 / max(axis_rmse**2, 1e-5)
+    axis_share = axis_w / (lin_w + axis_w)
+    if axis_rmse >= (lin_rmse * 0.95):
+        axis_share = min(axis_share, 0.20)
+    else:
+        axis_share = min(axis_share, 0.45)
+    pos = ((1.0 - axis_share) * p_linear) + (axis_share * p_axis)
+    return float(np.clip(pos, 0.0, 1.0)), {"linear_rmse": lin_rmse, "axis_rmse": axis_rmse}
+
+
 def fit_tab_model(samples_by_tab, calibration_tab_count=None):
     """Fit tab model from per-tab iris samples.
 
@@ -248,6 +307,7 @@ def fit_tab_model(samples_by_tab, calibration_tab_count=None):
     total_samples = 0
     reg_rows = []
     reg_targets = []
+    reg_weights = []
 
     tab_ids = sorted(int(k) for k in samples_by_tab.keys())
     inferred_tab_count = int(max(tab_ids) + 1) if tab_ids else 0
@@ -264,10 +324,15 @@ def fit_tab_model(samples_by_tab, calibration_tab_count=None):
         centers[tab_idx] = [float(center[0]), float(center[1])]
         all_points.append(pts)
         total_samples += int(len(pts))
+        mad = np.median(np.abs(pts - center), axis=0) + np.asarray([0.003, 0.003], dtype=float)
+        norm_dist = ((pts - center) / mad) ** 2
+        sample_weights = np.exp(-0.5 * np.sum(norm_dist, axis=1))
+        sample_weights = np.clip(sample_weights, 0.12, 1.0)
         # Model target as normalized tab-center coordinate for portability.
         target_pos = (tab_idx + 0.5) / float(calibration_tab_count)
         reg_rows.extend(np.column_stack([np.ones(len(pts)), pts]).tolist())
         reg_targets.extend([target_pos] * len(pts))
+        reg_weights.extend(sample_weights.tolist())
 
     if len(centers) < 2:
         return None
@@ -277,14 +342,58 @@ def fit_tab_model(samples_by_tab, calibration_tab_count=None):
     inv_cov = np.linalg.pinv(cov)
     X = np.asarray(reg_rows, dtype=float)
     y = np.asarray(reg_targets, dtype=float)
-    ridge = np.diag([1e-6, 1e-3, 1e-3])
-    weights = np.linalg.pinv(X.T @ X + ridge) @ (X.T @ y)
+    w = np.asarray(reg_weights, dtype=float)
+    weights = _weighted_ridge_fit(X, y, w, ridge_diag=[1e-6, 1e-3, 1e-3])
+    if weights is None:
+        return None
     pred = X @ weights
-    rmse = float(np.sqrt(np.mean((pred - y) ** 2))) if len(y) else 1.0
+    rmse = float(np.sqrt(np.mean(((pred - y) ** 2) * np.clip(w, 0.1, 1.0)))) if len(y) else 1.0
+
+    center_items = sorted((int(k), np.asarray(v, dtype=float)) for k, v in centers.items())
+    center_idx = np.asarray([k for k, _ in center_items], dtype=float)
+    center_pts = np.asarray([v for _, v in center_items], dtype=float)
+    axis_center = np.mean(center_pts, axis=0)
+    centered = center_pts - axis_center
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axis_dir = vh[0] if vh.shape[0] > 0 else np.asarray([1.0, 0.0], dtype=float)
+    norm = float(np.linalg.norm(axis_dir))
+    if not np.isfinite(norm) or norm < EPS:
+        axis_dir = np.asarray([1.0, 0.0], dtype=float)
+    else:
+        axis_dir = axis_dir / norm
+    proj_centers = centered @ axis_dir
+    if len(proj_centers) >= 2:
+        corr = np.corrcoef(proj_centers, center_idx)[0, 1]
+        if np.isfinite(corr) and corr < 0.0:
+            axis_dir = -axis_dir
+            proj_centers = -proj_centers
+
+    sample_pts = X[:, 1:3]
+    sample_proj = (sample_pts - axis_center.reshape(1, 2)) @ axis_dir
+    axis_X = np.column_stack([np.ones(len(sample_proj)), sample_proj])
+    axis_weights = _weighted_ridge_fit(axis_X, y, w, ridge_diag=[1e-6, 1e-3])
+    if axis_weights is None:
+        axis_weights = np.asarray([0.5, 0.0], dtype=float)
+    axis_pred = axis_X @ axis_weights
+    axis_rmse = float(np.sqrt(np.mean(((axis_pred - y) ** 2) * np.clip(w, 0.1, 1.0)))) if len(y) else 1.0
+    center_pos = {}
+    for tab_i, tab_center in center_items:
+        x = np.asarray([1.0, float(tab_center[0]), float(tab_center[1])], dtype=float)
+        center_pos[int(tab_i)] = float(np.clip(float(x @ weights), 0.0, 1.0))
+    if center_pos:
+        ordered_idx = sorted(center_pos.keys())
+        ordered_vals = np.asarray([center_pos[i] for i in ordered_idx], dtype=float)
+        ordered_vals = np.maximum.accumulate(ordered_vals)
+        if float(ordered_vals[-1] - ordered_vals[0]) > 1e-5:
+            ordered_vals = (ordered_vals - ordered_vals[0]) / (ordered_vals[-1] - ordered_vals[0])
+            ordered_vals = 0.04 + (0.92 * ordered_vals)
+        else:
+            ordered_vals = (np.arange(len(ordered_idx), dtype=float) + 0.5) / float(len(ordered_idx))
+        center_pos = {int(tab_i): float(ordered_vals[j]) for j, tab_i in enumerate(ordered_idx)}
 
     return {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "mode": "continuous_tab_position_v1",
+        "mode": "continuous_tab_position_v2",
         "tab_count": len(centers),
         "calibration_tab_count": calibration_tab_count,
         "total_samples": total_samples,
@@ -295,16 +404,18 @@ def fit_tab_model(samples_by_tab, calibration_tab_count=None):
             "weights": [float(w) for w in weights.tolist()],
             "rmse": float(rmse),
         },
+        "axis_model": {
+            "center": [float(axis_center[0]), float(axis_center[1])],
+            "direction": [float(axis_dir[0]), float(axis_dir[1])],
+            "weights": [float(axis_weights[0]), float(axis_weights[1])],
+            "rmse": float(axis_rmse),
+        },
+        "tab_position_centers": {str(k): float(v) for k, v in sorted(center_pos.items())},
     }
 
 
 def _predict_normalized_position(model, h, v):
-    pm = model.get("position_model") or {}
-    weights = np.asarray(pm.get("weights", []), dtype=float)
-    if weights.shape != (3,):
-        return None
-    x = np.asarray([1.0, float(h), float(v)], dtype=float)
-    pos = float(np.clip(float(x @ weights), 0.0, 1.0))
+    pos, _ = _combined_position(model, h, v)
     return pos
 
 
@@ -324,19 +435,33 @@ def predict_tab_position(model, h, v):
 
 def predict_tab(model, h, v, tab_count=None):
     """Return (tab_id, confidence, score_map)."""
-    norm_pos = _predict_normalized_position(model, h, v)
+    norm_pos, err_meta = _combined_position(model, h, v)
     if norm_pos is not None:
         runtime_tabs = _resolve_runtime_tab_count(model, tab_count)
         idx = int(norm_pos * runtime_tabs)
         idx = min(max(idx, 0), runtime_tabs - 1)
         slot_pos = (norm_pos * runtime_tabs) - (idx + 0.5)
         boundary_margin = max(0.0, 0.5 - abs(slot_pos)) * 2.0
-        rmse = float((model.get("position_model") or {}).get("rmse", 0.12))
-        rmse_factor = float(np.exp(-min(1.0, max(0.0, rmse * 8.0))))
-        confidence = float(np.clip(boundary_margin * rmse_factor, 0.0, 1.0))
-        centers = np.arange(runtime_tabs, dtype=float) + 0.5
+        center_idx = np.arange(runtime_tabs, dtype=int)
+        centers = center_idx.astype(float) + 0.5
         center_norm = centers / float(runtime_tabs)
-        score_map = {int(i): float(abs(norm_pos - c)) for i, c in enumerate(center_norm)}
+        distances = np.abs(center_norm - norm_pos)
+        rmse = float((model.get("position_model") or {}).get("rmse", 0.12))
+        if err_meta is not None:
+            rmse = min(
+                float(err_meta.get("linear_rmse", rmse)),
+                float(err_meta.get("axis_rmse", rmse)),
+            )
+        rmse_factor = float(np.exp(-min(1.0, max(0.0, rmse * 7.0))))
+        score_map = {int(tab_i): float(distances[j]) for j, tab_i in enumerate(center_idx)}
+        sorted_d = np.sort(distances)
+        sep = 0.0
+        if len(sorted_d) >= 2:
+            sep = float((sorted_d[1] - sorted_d[0]) * runtime_tabs)
+        sep_factor = float(1.0 - np.exp(-max(0.0, sep * 2.4)))
+        confidence = float(
+            np.clip((0.62 * boundary_margin + 0.38 * sep_factor) * rmse_factor, 0.0, 1.0)
+        )
         return idx, confidence, score_map
 
     centers = model.get("centers", {})

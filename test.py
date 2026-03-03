@@ -27,6 +27,7 @@ from model import (
     is_active_chromium_family_window,
     launch_managed_chromium_session,
     load_tab_model,
+    predict_tab_position,
     predict_tab,
     select_chromium_tab,
     tab_rectangles,
@@ -277,6 +278,7 @@ def main():
             active_elapsed = 0.0
             last_tick = time.monotonic()
             votes = []
+            pos_votes = []
             print(f"Trial {idx}/{len(trial_order)} target={target_tab + 1} capturing...")
             while active_elapsed < CAPTURE_SECONDS:
                 now = time.monotonic()
@@ -315,9 +317,14 @@ def main():
                 result = tracker.process(frame, apply_head_comp=True)
                 if result is not None:
                     (h, v), _ = result
-                    pred_tab, _, _ = predict_tab(model, h, v, tab_count=tab_count)
+                    pred_tab, conf, _ = predict_tab(model, h, v, tab_count=tab_count)
                     if pred_tab is not None:
                         votes.append(pred_tab)
+                        pos = predict_tab_position(model, h, v)
+                        if pos is None:
+                            pos = float((int(pred_tab) + 0.5) / float(tab_count))
+                        if conf >= 0.12:
+                            pos_votes.append(float(pos))
 
                 if args.show_status_window:
                     disp = np.zeros((160, 460, 3), dtype=np.uint8)
@@ -329,7 +336,11 @@ def main():
                         print("Cancelled.")
                         return
 
-            if votes:
+            if pos_votes:
+                pos_arr = np.asarray(pos_votes, dtype=float)
+                med_pos = float(np.median(pos_arr))
+                final_pred = int(np.clip(med_pos * tab_count, 0, tab_count - 1))
+            elif votes:
                 vals, counts = np.unique(np.asarray(votes, dtype=int), return_counts=True)
                 final_pred = int(vals[int(np.argmax(counts))])
             else:

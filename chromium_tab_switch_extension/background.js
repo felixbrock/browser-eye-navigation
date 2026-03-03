@@ -2,10 +2,15 @@ const STATE_URL = "http://127.0.0.1:8766/state";
 const POLL_MS = 220;
 const MIN_CONFIDENCE = 0.20;
 const SWITCH_COOLDOWN_MS = 500;
+const STATE_STALE_MS = 2000;
+const TARGET_STREAK_REQUIRED = 2;
 
 let switchingEnabled = false;
 let lastSwitchAt = 0;
 let lastTargetIndex = -1;
+let pendingTargetIndex = -1;
+let pendingTargetStreak = 0;
+let tickInFlight = false;
 
 async function fetchState() {
   const resp = await fetch(STATE_URL, { cache: "no-store" });
@@ -62,6 +67,11 @@ async function switchToPredictedTab(predictedTab, predictedPosition, tabCountFro
 }
 
 async function tick() {
+  if (tickInFlight) {
+    return;
+  }
+  tickInFlight = true;
+  try {
   if (!switchingEnabled) {
     return;
   }
@@ -73,6 +83,10 @@ async function tick() {
   }
 
   if (!state || !state.running) {
+    return;
+  }
+  const ageMs = Math.max(0, nowMs() - Math.round(Number(state.updated_at || 0) * 1000));
+  if (ageMs > STATE_STALE_MS) {
     return;
   }
   if (!state.browser_active) {
@@ -103,6 +117,15 @@ async function tick() {
     desiredIndex = predictedTab - 1;
   }
   desiredIndex = Math.max(0, Math.min(liveCount - 1, desiredIndex));
+  if (desiredIndex === pendingTargetIndex) {
+    pendingTargetStreak += 1;
+  } else {
+    pendingTargetIndex = desiredIndex;
+    pendingTargetStreak = 1;
+  }
+  if (pendingTargetStreak < TARGET_STREAK_REQUIRED) {
+    return;
+  }
   if (desiredIndex === lastTargetIndex) {
     return;
   }
@@ -114,6 +137,9 @@ async function tick() {
   } catch (_err) {
     // Ignore switching errors.
   }
+  } finally {
+    tickInFlight = false;
+  }
 }
 
 chrome.commands.onCommand.addListener(async (command) => {
@@ -123,6 +149,8 @@ chrome.commands.onCommand.addListener(async (command) => {
   switchingEnabled = !switchingEnabled;
   if (!switchingEnabled) {
     lastTargetIndex = -1;
+    pendingTargetIndex = -1;
+    pendingTargetStreak = 0;
   }
   await setUi();
 });
@@ -131,6 +159,8 @@ chrome.action.onClicked.addListener(async () => {
   switchingEnabled = !switchingEnabled;
   if (!switchingEnabled) {
     lastTargetIndex = -1;
+    pendingTargetIndex = -1;
+    pendingTargetStreak = 0;
   }
   await setUi();
 });

@@ -1,5 +1,6 @@
 const STATE_URL = "http://127.0.0.1:8765/state";
 const POLL_MS = 120;
+const STATE_STALE_MS = 2500;
 
 const MASK_TITLE = "·";
 const TARGET_TITLE = "●";
@@ -9,6 +10,7 @@ const TARGET_COLOR = "#ff2b2b";
 let lastEnabled = null;
 let lastActiveTabId = null;
 let lastTargetTab = 0;
+let tickInFlight = false;
 
 function isScriptableUrl(url) {
   if (!url) return false;
@@ -144,32 +146,43 @@ async function applyCalibrationVisuals(enabled) {
 }
 
 async function tick() {
+  if (tickInFlight) {
+    return;
+  }
+  tickInFlight = true;
   let enabled = false;
   let targetTab = 0;
   try {
-    const state = await fetchState();
-    enabled = Boolean(state && state.enabled);
-    targetTab = Number(state?.target_tab || 0);
-  } catch (_err) {
-    enabled = false;
-    targetTab = 0;
-  }
+    try {
+      const state = await fetchState();
+      const ageMs = Math.max(0, Date.now() - Math.round(Number(state?.updated_at || 0) * 1000));
+      if (state && state.enabled && ageMs <= STATE_STALE_MS) {
+        enabled = true;
+        targetTab = Number(state?.target_tab || 0);
+      }
+    } catch (_err) {
+      enabled = false;
+      targetTab = 0;
+    }
 
-  if (enabled && targetTab >= 1) {
-    await activateTargetTab(targetTab);
-  }
+    if (enabled && targetTab >= 1) {
+      await activateTargetTab(targetTab);
+    }
 
-  const activeTab = await activeTabInCurrentWindow();
-  const activeId = activeTab && activeTab.id ? activeTab.id : null;
-  const shouldRefresh =
-    lastEnabled !== enabled ||
-    lastTargetTab !== targetTab ||
-    (enabled && activeId !== lastActiveTabId);
+    const activeTab = await activeTabInCurrentWindow();
+    const activeId = activeTab && activeTab.id ? activeTab.id : null;
+    const shouldRefresh =
+      lastEnabled !== enabled ||
+      lastTargetTab !== targetTab ||
+      (enabled && activeId !== lastActiveTabId);
 
-  if (shouldRefresh) {
-    await applyCalibrationVisuals(enabled);
-    lastEnabled = enabled;
-    lastTargetTab = targetTab;
+    if (shouldRefresh) {
+      await applyCalibrationVisuals(enabled);
+      lastEnabled = enabled;
+      lastTargetTab = targetTab;
+    }
+  } finally {
+    tickInFlight = false;
   }
 }
 

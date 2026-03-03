@@ -30,6 +30,9 @@ from model import (
 
 TOP_H = 72
 DEFAULT_SWITCH_PORT = 8766
+POSITION_EMA_ALPHA = 0.35
+MIN_CONFIDENCE_FOR_SWITCH = 0.16
+SWITCH_MAJORITY_THRESHOLD = 0.66
 
 
 class SwitchStatePublisher:
@@ -162,10 +165,12 @@ def main():
         raise SystemExit("ERROR: Cannot open webcam")
 
     tracker = EyeTracker()
-    vote_hist = deque(maxlen=7)
+    vote_hist = deque(maxlen=9)
     win = "Tab Tracker Status"
     last_conf = 0.0
     last_reported = None
+    smoothed_pos = None
+    stable_active = None
     switch_publisher = None
     if not args.disable_switch_publisher:
         try:
@@ -218,28 +223,48 @@ def main():
                         break
                 continue
             result = tracker.process(frame, apply_head_comp=True)
-            active = None
+            active = stable_active
             if result is not None:
                 (h, v), _ = result
                 pred, conf, _ = predict_tab(model, h, v, tab_count=runtime_tab_count)
                 if pred is not None:
-                    vote_hist.append(pred)
-                    vals, counts = np.unique(np.asarray(vote_hist, dtype=int), return_counts=True)
-                    active = int(vals[int(np.argmax(counts))])
-                    last_conf = conf
                     pred_pos = predict_tab_position(model, h, v)
                     if pred_pos is None:
-                        pred_pos = float((active + 0.5) / float(runtime_tab_count))
+                        pred_pos = float((int(pred) + 0.5) / float(runtime_tab_count))
+                    if smoothed_pos is None:
+                        smoothed_pos = float(pred_pos)
+                    else:
+                        smoothed_pos = float(
+                            (POSITION_EMA_ALPHA * float(pred_pos))
+                            + ((1.0 - POSITION_EMA_ALPHA) * float(smoothed_pos))
+                        )
+                    smooth_idx = int(np.clip(smoothed_pos * runtime_tab_count, 0, runtime_tab_count - 1))
+                    if conf >= MIN_CONFIDENCE_FOR_SWITCH:
+                        vote_hist.append(int(smooth_idx))
+                    elif stable_active is not None:
+                        vote_hist.append(int(stable_active))
+                    if vote_hist:
+                        vals, counts = np.unique(np.asarray(vote_hist, dtype=int), return_counts=True)
+                        best_i = int(np.argmax(counts))
+                        voted_idx = int(vals[best_i])
+                        voted_ratio = float(counts[best_i]) / float(len(vote_hist))
+                        if stable_active is None or voted_idx == stable_active:
+                            stable_active = int(voted_idx)
+                        elif voted_ratio >= SWITCH_MAJORITY_THRESHOLD and conf >= MIN_CONFIDENCE_FOR_SWITCH:
+                            stable_active = int(voted_idx)
+                    active = stable_active
+                    last_conf = conf
+                    publish_pos = float(smoothed_pos if smoothed_pos is not None else pred_pos)
                     if switch_publisher is not None:
                         switch_publisher.update(
                             running=True,
-                            predicted_tab=int(active) + 1,
-                            predicted_position=float(pred_pos),
+                            predicted_tab=int(active) + 1 if active is not None else 0,
+                            predicted_position=float(publish_pos),
                             confidence=float(last_conf),
                             tab_count=int(runtime_tab_count),
                             browser_active=True,
                         )
-                    if active != last_reported:
+                    if active is not None and active != last_reported:
                         print(f"Predicted tab={active + 1} confidence={last_conf:.2f}")
                         last_reported = active
 
