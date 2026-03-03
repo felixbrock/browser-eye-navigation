@@ -29,12 +29,15 @@ from gaze_core import (
     WEBCAM_INDEX,
     WEBCAM_W,
 )
-from tab_model import (
+from model import (
     TAB_SETTINGS_FILE,
     chromium_tab_rectangles,
+    close_managed_chromium_session,
+    focus_managed_chromium_session,
     focus_chromium_family_window,
     fit_tab_model,
     is_active_chromium_family_window,
+    launch_managed_chromium_session,
     predict_tab,
     save_tab_model,
     select_chromium_tab,
@@ -44,7 +47,7 @@ from tab_model import (
 
 OUT_DIR = "calibration_logs"
 TARGET_TOP_H = 72
-DEFAULT_TABS = 8
+DEFAULT_TABS = 10
 DEFAULT_ROUNDS = 2
 TARGET_CAPTURE_SECONDS = 1.1
 TARGET_DWELL_SECONDS = 0.25
@@ -187,11 +190,12 @@ def _fit_from_log(log_path):
     with open(log_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     samples_by_tab = defaultdict(list)
+    calibration_tab_count = int(payload.get("tab_count") or 0)
     for trial in payload.get("trials", []):
         tab_idx = int(trial["tab_index"])
         for s in trial.get("samples", []):
             samples_by_tab[tab_idx].append([float(s["iris_h"]), float(s["iris_v"])])
-    model = fit_tab_model(samples_by_tab)
+    model = fit_tab_model(samples_by_tab, calibration_tab_count=calibration_tab_count or None)
     if model is None:
         raise RuntimeError("not enough valid samples in log to fit tab model")
     save_tab_model(model)
@@ -201,7 +205,7 @@ def _fit_from_log(log_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tabs", type=int, default=DEFAULT_TABS)
+    ap.add_argument("--tabs", type=int, default=DEFAULT_TABS, help="calibration is fixed to 10 tabs")
     ap.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
     ap.add_argument("--fit-only", action="store_true")
     ap.add_argument("--log-file", type=str, default="")
@@ -217,21 +221,47 @@ def main():
         _fit_from_log(args.log_file)
         return
 
-    tab_count = max(2, min(20, int(args.tabs)))
+    if int(args.tabs) != int(DEFAULT_TABS):
+        print(f"Ignoring --tabs={int(args.tabs)}; calibration is fixed to {DEFAULT_TABS} tabs.")
+    tab_count = int(DEFAULT_TABS)
     rounds = max(1, min(8, int(args.rounds)))
-    if not args.allow_any_window and tab_count > 9:
-        raise SystemExit("Chromium auto tab selection supports up to 9 tabs. Use --tabs <= 9.")
+    managed_session = None
+    if not args.allow_any_window:
+        use_overlay = not args.disable_browser_overlay
+        overlay_dir = os.path.join(os.path.dirname(__file__), "chromium_tab_overlay_extension")
+        managed_session, launch_err = launch_managed_chromium_session(
+            min_tabs=tab_count,
+            max_tabs=tab_count,
+            load_overlay_extension=use_overlay,
+            overlay_extension_dir=overlay_dir,
+        )
+        if launch_err is not None:
+            raise SystemExit(launch_err)
+        tab_count = int(managed_session["tab_count"])
+        print(
+            "Launched managed browser session: "
+            f"tabs={tab_count} profile={managed_session['profile_dir']}"
+        )
+        time.sleep(1.2)
 
     monitor = get_monitors()[0]
     sw, sh = monitor.width, monitor.height
     if args.allow_any_window:
         _ = tab_rectangles(sw, TARGET_TOP_H, tab_count)
     else:
-        ok, focus_err = focus_chromium_family_window()
+        ok, focus_err = (False, None)
+        if managed_session is not None:
+            ok, focus_err = focus_managed_chromium_session(managed_session)
         if not ok:
+            ok, focus_err = focus_chromium_family_window()
+        if not ok:
+            if managed_session is not None:
+                close_managed_chromium_session(managed_session)
             raise SystemExit(focus_err)
         _, err = chromium_tab_rectangles(sw, TARGET_TOP_H, tab_count)
         if err is not None:
+            if managed_session is not None:
+                close_managed_chromium_session(managed_session)
             raise SystemExit(
                 f"{err}\nCould not auto-focus Chromium-family window. Pass --allow-any-window if needed."
             )
@@ -246,6 +276,8 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_H)
     if not cap.isOpened():
         print("ERROR: Cannot open webcam")
+        if managed_session is not None:
+            close_managed_chromium_session(managed_session)
         return
 
     tracker = EyeTracker()
@@ -339,7 +371,13 @@ def main():
                         phase = "paused"
                         t0 = time.time()
                         continue
-                    select_chromium_tab(tab_idx)
+                    # In overlay mode, extension activates tab by index directly.
+                    if overlay_publisher is None:
+                        selected = select_chromium_tab(tab_idx, tab_count=tab_count)
+                        if not selected:
+                            phase = "paused"
+                            t0 = time.time()
+                            continue
                     time.sleep(BROWSER_SETTLE_SECONDS)
                     trial_target_set = True
                     t0 = time.time()
@@ -433,7 +471,7 @@ def main():
             )
             print(f"Trial {trial_idx}/{len(trial_order)} tab={tab_idx + 1} samples={len(samples)} rejects={quality_rejects}")
 
-        model = fit_tab_model(samples_by_tab)
+        model = fit_tab_model(samples_by_tab, calibration_tab_count=tab_count)
         if model is None:
             print("Not enough valid data to fit tab model.")
             return
@@ -480,6 +518,8 @@ def main():
         cap.release()
         tracker.close()
         cv2.destroyAllWindows()
+        if managed_session is not None:
+            close_managed_chromium_session(managed_session)
 
 
 if __name__ == "__main__":

@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -36,21 +39,235 @@ I3_FOCUS_APP_IDS = (
     "google-chrome",
     "chromium",
 )
+DEFAULT_SESSION_URL = "https://en.wikipedia.org/wiki/Eye_tracking"
+DEFAULT_SESSION_MIN_TABS = 3
+DEFAULT_SESSION_MAX_TABS = 20
 
 
-def fit_tab_model(samples_by_tab):
-    """Fit centroid + pooled covariance model from per-tab iris samples."""
+def chromium_browser_binary():
+    """Return available Chromium-family browser binary, or None."""
+    for name in (
+        "brave",
+        "brave-browser",
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+    ):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def launch_managed_chromium_session(
+    *,
+    session_url=DEFAULT_SESSION_URL,
+    min_tabs=DEFAULT_SESSION_MIN_TABS,
+    max_tabs=DEFAULT_SESSION_MAX_TABS,
+    load_overlay_extension=False,
+    overlay_extension_dir=None,
+):
+    """Launch isolated Chromium-family browser instance with random tab count."""
+    browser = chromium_browser_binary()
+    if browser is None:
+        return None, "Could not find Brave/Chrome/Chromium binary on PATH."
+    low = int(max(2, min_tabs))
+    high = int(max(low, max_tabs))
+    tab_count = random.randint(low, high)
+    profile_dir = tempfile.mkdtemp(prefix="gaze-tab-session-")
+
+    args = [
+        browser,
+        "--new-window",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--user-data-dir={profile_dir}",
+    ]
+    if load_overlay_extension and overlay_extension_dir and os.path.isdir(overlay_extension_dir):
+        ext = os.path.abspath(overlay_extension_dir)
+        args.append(f"--disable-extensions-except={ext}")
+        args.append(f"--load-extension={ext}")
+    args.extend([session_url] * tab_count)
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        return None, f"Failed to launch browser session: {exc}"
+
+    session = {
+        "browser": browser,
+        "profile_dir": profile_dir,
+        "tab_count": int(tab_count),
+        "url": session_url,
+        "pid": int(proc.pid),
+    }
+    return session, None
+
+
+def close_managed_chromium_session(session):
+    """Close only the managed Chromium session and remove its profile dir."""
+    if not session:
+        return
+    profile_dir = str(session.get("profile_dir") or "").strip()
+    pid = int(session.get("pid") or 0)
+
+    if pid > 0:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                break
+            time.sleep(0.25)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+
+    # Sweep any remaining processes tied to this profile only.
+    if profile_dir:
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", profile_dir],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rem_pid = int(line)
+                except ValueError:
+                    continue
+                if rem_pid == os.getpid():
+                    continue
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(rem_pid, sig)
+                    except OSError:
+                        break
+                    time.sleep(0.10)
+                    try:
+                        os.kill(rem_pid, 0)
+                    except OSError:
+                        break
+        except Exception:
+            pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def focus_managed_chromium_session(session):
+    """Focus the window belonging to a managed browser session."""
+    if not session:
+        return False, "No managed session provided."
+    if shutil.which("xdotool") is None:
+        return False, "xdotool is required to focus managed browser session."
+
+    profile_dir = str(session.get("profile_dir") or "").strip()
+    pids = []
+    try:
+        root_pid = int(session.get("pid") or 0)
+    except (TypeError, ValueError):
+        root_pid = 0
+    if root_pid > 0:
+        pids.append(root_pid)
+
+    if profile_dir:
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", profile_dir],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    p = int(line)
+                except ValueError:
+                    continue
+                if p not in pids:
+                    pids.append(p)
+        except Exception:
+            pass
+
+    win_ids = []
+    for pid in pids:
+        try:
+            proc = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        for line in proc.stdout.splitlines():
+            w = line.strip()
+            if w:
+                win_ids.append(w)
+
+    if not win_ids:
+        return False, "Could not find managed browser window by PID."
+
+    for win_id in reversed(win_ids):
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", str(win_id)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            time.sleep(0.08)
+            if is_active_chromium_family_window():
+                return True, None
+        except subprocess.CalledProcessError:
+            continue
+
+    return False, "Could not activate managed browser window."
+
+
+def fit_tab_model(samples_by_tab, calibration_tab_count=None):
+    """Fit tab model from per-tab iris samples.
+
+    The primary model predicts normalized horizontal tab position in [0, 1],
+    which can be remapped to any runtime tab count.
+    """
     centers = {}
     all_points = []
     total_samples = 0
+    reg_rows = []
+    reg_targets = []
+
+    tab_ids = sorted(int(k) for k in samples_by_tab.keys())
+    inferred_tab_count = int(max(tab_ids) + 1) if tab_ids else 0
+    if calibration_tab_count is None:
+        calibration_tab_count = inferred_tab_count
+    calibration_tab_count = int(max(2, calibration_tab_count))
+
     for tab_id, samples in samples_by_tab.items():
         pts = np.asarray(samples, dtype=float)
         if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 6:
             continue
+        tab_idx = int(tab_id)
         center = np.median(pts, axis=0)
-        centers[int(tab_id)] = [float(center[0]), float(center[1])]
+        centers[tab_idx] = [float(center[0]), float(center[1])]
         all_points.append(pts)
         total_samples += int(len(pts))
+        # Model target as normalized tab-center coordinate for portability.
+        target_pos = (tab_idx + 0.5) / float(calibration_tab_count)
+        reg_rows.extend(np.column_stack([np.ones(len(pts)), pts]).tolist())
+        reg_targets.extend([target_pos] * len(pts))
 
     if len(centers) < 2:
         return None
@@ -58,18 +275,70 @@ def fit_tab_model(samples_by_tab):
     joined = np.vstack(all_points)
     cov = np.cov(joined.T) + np.eye(2) * 1e-4
     inv_cov = np.linalg.pinv(cov)
+    X = np.asarray(reg_rows, dtype=float)
+    y = np.asarray(reg_targets, dtype=float)
+    ridge = np.diag([1e-6, 1e-3, 1e-3])
+    weights = np.linalg.pinv(X.T @ X + ridge) @ (X.T @ y)
+    pred = X @ weights
+    rmse = float(np.sqrt(np.mean((pred - y) ** 2))) if len(y) else 1.0
+
     return {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": "continuous_tab_position_v1",
         "tab_count": len(centers),
+        "calibration_tab_count": calibration_tab_count,
         "total_samples": total_samples,
         "centers": {str(k): v for k, v in sorted(centers.items())},
         "inv_cov": inv_cov.tolist(),
         "cov": cov.tolist(),
+        "position_model": {
+            "weights": [float(w) for w in weights.tolist()],
+            "rmse": float(rmse),
+        },
     }
 
 
-def predict_tab(model, h, v):
+def _predict_normalized_position(model, h, v):
+    pm = model.get("position_model") or {}
+    weights = np.asarray(pm.get("weights", []), dtype=float)
+    if weights.shape != (3,):
+        return None
+    x = np.asarray([1.0, float(h), float(v)], dtype=float)
+    pos = float(np.clip(float(x @ weights), 0.0, 1.0))
+    return pos
+
+
+def _resolve_runtime_tab_count(model, tab_count):
+    if tab_count is not None:
+        return max(2, int(tab_count))
+    model_count = int(model.get("calibration_tab_count") or model.get("tab_count") or 0)
+    if model_count >= 2:
+        return model_count
+    return max(2, len(model.get("centers", {})))
+
+
+def predict_tab_position(model, h, v):
+    """Return normalized tab position in [0, 1], or None for legacy models."""
+    return _predict_normalized_position(model, h, v)
+
+
+def predict_tab(model, h, v, tab_count=None):
     """Return (tab_id, confidence, score_map)."""
+    norm_pos = _predict_normalized_position(model, h, v)
+    if norm_pos is not None:
+        runtime_tabs = _resolve_runtime_tab_count(model, tab_count)
+        idx = int(norm_pos * runtime_tabs)
+        idx = min(max(idx, 0), runtime_tabs - 1)
+        slot_pos = (norm_pos * runtime_tabs) - (idx + 0.5)
+        boundary_margin = max(0.0, 0.5 - abs(slot_pos)) * 2.0
+        rmse = float((model.get("position_model") or {}).get("rmse", 0.12))
+        rmse_factor = float(np.exp(-min(1.0, max(0.0, rmse * 8.0))))
+        confidence = float(np.clip(boundary_margin * rmse_factor, 0.0, 1.0))
+        centers = np.arange(runtime_tabs, dtype=float) + 0.5
+        center_norm = centers / float(runtime_tabs)
+        score_map = {int(i): float(abs(norm_pos - c)) for i, c in enumerate(center_norm)}
+        return idx, confidence, score_map
+
     centers = model.get("centers", {})
     if not centers:
         return None, 0.0, {}
@@ -294,21 +563,45 @@ def focus_chromium_family_window():
     return False, "Could not focus a Brave/Google Chrome/Chromium window (i3-msg + xdotool tried)."
 
 
-def select_chromium_tab(tab_idx):
-    """Select Chromium tab by active window using Ctrl+1..8 (Ctrl+9 for last tab)."""
+def select_chromium_tab(tab_idx, tab_count=None):
+    """Select Chromium tab by active window.
+
+    Tabs 1..8 use direct shortcuts. Tabs >=9 use Ctrl+8 then step right.
+    """
     win_id = active_window_id()
     if win_id is None:
         return False
-    slot = int(tab_idx) + 1
-    slot = min(max(slot, 1), 9)
-    key = f"ctrl+{slot}"
+    slot = max(1, int(tab_idx) + 1)
+
     try:
+        if slot <= 8:
+            subprocess.run(
+                ["xdotool", "key", "--window", str(win_id), f"ctrl+{slot}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return True
+
+        # Chromium maps Ctrl+9 to "last tab", so anchor at a stable known tab.
         subprocess.run(
-            ["xdotool", "key", "--window", str(win_id), key],
+            ["xdotool", "key", "--window", str(win_id), "ctrl+8"],
             check=True,
             capture_output=True,
             text=True,
         )
+        if slot == 8:
+            return True
+
+        # Move right from tab 8 for tab indexes >= 9.
+        steps = max(0, slot - 8)
+        for _ in range(steps):
+            subprocess.run(
+                ["xdotool", "key", "--window", str(win_id), "ctrl+Page_Down"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         return True
     except subprocess.CalledProcessError:
         return False

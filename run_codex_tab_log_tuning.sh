@@ -75,10 +75,10 @@ Task:
 1. Analyze the tab-calibration log below.
 2. Improve tab classification accuracy and robustness.
 3. Modify only tab-focused files:
-   - tab_model.py
-   - tab_calibration.py
-   - tab_tracker.py
-   - tab_test.py
+   - model.py
+   - calibration.py
+   - tracker.py
+   - test.py
    - chromium_tab_overlay_extension/*
    - chromium_tab_switch_extension/*
 4. Keep existing eye_tracker.py/calibration.py and train flow untouched.
@@ -110,7 +110,7 @@ if [[ -z "$(git status --porcelain)" ]]; then
   exit 0
 fi
 
-python3 -m py_compile tab_model.py tab_calibration.py tab_tracker.py tab_test.py
+python3 -m py_compile model.py calibration.py tracker.py test.py
 python3 - <<'PY'
 import json
 for p in (

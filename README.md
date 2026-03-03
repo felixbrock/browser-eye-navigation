@@ -1,15 +1,17 @@
 # Browser Eye Navigation
 
 Chromium tab navigation via webcam gaze tracking.
+The tab model now predicts normalized tab position, so it can be remapped to
+different runtime tab counts (for example calibrate with 10, run with 3 or 20).
 
 This repository contains the tab-focused workflow that was split from `eye-tracker`:
 
-- `tab_calibration.py`: calibrate and fit tab model
-- `tab_test.py`: objective tab accuracy test
-- `tab_tracker.py`: live tab prediction + switch-state publisher
+- `calibration.py`: calibrate and fit tab model
+- `test.py`: objective tab accuracy test
+- `tracker.py`: live tab prediction + switch-state publisher
 - `chromium_tab_overlay_extension/`: calibration/test visual tab markers
 - `chromium_tab_switch_extension/`: toggle gaze-driven tab switching
-- `train_tab` + `run_codex_tab_log_tuning.sh`: tab-only tuning flow
+- `train` + `run_codex_tab_log_tuning.sh`: tab-only tuning flow
 
 ## Install
 
@@ -21,17 +23,21 @@ uv sync
 
 1. Calibrate model:
 ```bash
-uv run python tab_calibration.py --tabs 8 --rounds 2
+uv run python calibration.py --rounds 2
 ```
 
 2. Test accuracy:
 ```bash
-uv run python tab_test.py --rounds 1
+uv run python test.py --rounds 1
+# Optional runtime remap count:
+uv run python test.py --rounds 1 --tabs 20
 ```
 
 3. Live tracking:
 ```bash
-uv run python tab_tracker.py
+uv run python tracker.py
+# Optional runtime remap count for local status output:
+uv run python tracker.py --tabs 20
 ```
 
 ## Extensions
@@ -41,4 +47,4 @@ Load unpacked extensions from:
 - `chromium_tab_overlay_extension/`
 - `chromium_tab_switch_extension/`
 
-In `tab_tracker` mode, toggle auto-switch with `Ctrl+Shift+Y` (or the extension icon).
+In `tracker` mode, toggle auto-switch with `Ctrl+Shift+Y` (or the extension icon).

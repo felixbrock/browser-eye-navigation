@@ -16,12 +16,13 @@ import numpy as np
 from screeninfo import get_monitors
 
 from gaze_core import EyeTracker, WEBCAM_H, WEBCAM_INDEX, WEBCAM_W
-from tab_model import (
+from model import (
     TAB_SETTINGS_FILE,
     chromium_tab_rectangles,
     focus_chromium_family_window,
     is_active_chromium_family_window,
     load_tab_model,
+    predict_tab_position,
     predict_tab,
     tab_rectangles,
 )
@@ -42,6 +43,7 @@ class SwitchStatePublisher:
         self._state = {
             "running": False,
             "predicted_tab": 0,
+            "predicted_position": 0.0,
             "confidence": 0.0,
             "tab_count": 0,
             "browser_active": False,
@@ -124,28 +126,30 @@ def main():
     ap.add_argument("--show-camera", action="store_true")
     ap.add_argument("--show-status-window", action="store_true")
     ap.add_argument("--allow-any-window", action="store_true")
+    ap.add_argument("--tabs", type=int, default=0, help="optional runtime tab count for local status mapping")
     ap.add_argument("--disable-switch-publisher", action="store_true")
     ap.add_argument("--switch-publisher-port", type=int, default=DEFAULT_SWITCH_PORT)
     args = ap.parse_args()
 
     if not os.path.exists(args.model_file):
         raise SystemExit(
-            f"Tab model not found at {args.model_file}. Run: uv run python tab_calibration.py"
+            f"Tab model not found at {args.model_file}. Run: uv run python calibration.py"
         )
     model = load_tab_model(args.model_file)
-    tab_count = int(model.get("tab_count") or len(model.get("centers", {})))
-    if tab_count < 2:
-        raise SystemExit("Invalid tab model; recalibrate with tab_calibration.py")
+    model_tab_count = int(model.get("calibration_tab_count") or model.get("tab_count") or len(model.get("centers", {})))
+    if model_tab_count < 2:
+        raise SystemExit("Invalid tab model; recalibrate with calibration.py")
+    runtime_tab_count = int(args.tabs) if int(args.tabs) >= 2 else model_tab_count
 
     monitor = get_monitors()[0]
     sw = monitor.width
     if args.allow_any_window:
-        _ = tab_rectangles(sw, TOP_H, tab_count)
+        _ = tab_rectangles(sw, TOP_H, runtime_tab_count)
     else:
         ok, focus_err = focus_chromium_family_window()
         if not ok:
             raise SystemExit(focus_err)
-        _, err = chromium_tab_rectangles(sw, TOP_H, tab_count)
+        _, err = chromium_tab_rectangles(sw, TOP_H, runtime_tab_count)
         if err is not None:
             raise SystemExit(
                 f"{err}\nCould not auto-focus Chromium-family window. Pass --allow-any-window if needed."
@@ -167,7 +171,12 @@ def main():
         try:
             switch_publisher = SwitchStatePublisher(args.switch_publisher_port)
             switch_publisher.start()
-            switch_publisher.update(running=True, tab_count=int(tab_count), browser_active=True)
+            switch_publisher.update(
+                running=True,
+                tab_count=int(runtime_tab_count),
+                browser_active=True,
+                predicted_position=0.0,
+            )
             print(
                 "Tab switch publisher running at "
                 f"http://127.0.0.1:{args.switch_publisher_port}/state"
@@ -191,8 +200,9 @@ def main():
                 switch_publisher.update(
                     running=True,
                     predicted_tab=0,
+                    predicted_position=0.0,
                     confidence=0.0,
-                    tab_count=int(tab_count),
+                    tab_count=int(runtime_tab_count),
                     browser_active=False,
                 )
                 if args.show_status_window:
@@ -211,18 +221,22 @@ def main():
             active = None
             if result is not None:
                 (h, v), _ = result
-                pred, conf, _ = predict_tab(model, h, v)
+                pred, conf, _ = predict_tab(model, h, v, tab_count=runtime_tab_count)
                 if pred is not None:
                     vote_hist.append(pred)
                     vals, counts = np.unique(np.asarray(vote_hist, dtype=int), return_counts=True)
                     active = int(vals[int(np.argmax(counts))])
                     last_conf = conf
+                    pred_pos = predict_tab_position(model, h, v)
+                    if pred_pos is None:
+                        pred_pos = float((active + 0.5) / float(runtime_tab_count))
                     if switch_publisher is not None:
                         switch_publisher.update(
                             running=True,
                             predicted_tab=int(active) + 1,
+                            predicted_position=float(pred_pos),
                             confidence=float(last_conf),
-                            tab_count=int(tab_count),
+                            tab_count=int(runtime_tab_count),
                             browser_active=True,
                         )
                     if active != last_reported:

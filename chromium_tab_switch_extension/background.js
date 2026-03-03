@@ -5,7 +5,7 @@ const SWITCH_COOLDOWN_MS = 500;
 
 let switchingEnabled = false;
 let lastSwitchAt = 0;
-let lastTargetTab = 0;
+let lastTargetIndex = -1;
 
 async function fetchState() {
   const resp = await fetch(STATE_URL, { cache: "no-store" });
@@ -31,14 +31,23 @@ async function setUi() {
   }
 }
 
-async function switchToPredictedTab(predictedTab, tabCountFromState) {
+async function switchToPredictedTab(predictedTab, predictedPosition, tabCountFromState) {
   const tabs = await chrome.tabs.query({ currentWindow: true });
   if (!tabs || tabs.length === 0) {
     return;
   }
   const ordered = [...tabs].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-  const limit = Math.min(ordered.length, Number(tabCountFromState) || ordered.length);
-  const targetIndex = Math.max(0, Math.min(limit - 1, Number(predictedTab) - 1));
+  const limit = ordered.length;
+  let targetIndex = 0;
+
+  if (Number.isFinite(predictedPosition) && predictedPosition >= 0) {
+    targetIndex = Math.floor(predictedPosition * limit);
+  } else if (Number.isFinite(predictedTab) && predictedTab >= 1) {
+    const modelCount = Number(tabCountFromState) || limit;
+    const centerPos = (predictedTab - 0.5) / Math.max(1, modelCount);
+    targetIndex = Math.floor(centerPos * limit);
+  }
+  targetIndex = Math.max(0, Math.min(limit - 1, targetIndex));
   const target = ordered[targetIndex];
   if (!target || !target.id) {
     return;
@@ -71,8 +80,9 @@ async function tick() {
   }
 
   const predictedTab = Number(state.predicted_tab || 0);
+  const predictedPosition = Number(state.predicted_position);
   const conf = Number(state.confidence || 0);
-  if (predictedTab < 1 || conf < MIN_CONFIDENCE) {
+  if ((predictedTab < 1 && !Number.isFinite(predictedPosition)) || conf < MIN_CONFIDENCE) {
     return;
   }
 
@@ -81,14 +91,26 @@ async function tick() {
     return;
   }
 
-  if (predictedTab === lastTargetTab) {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  if (!tabs || tabs.length === 0) {
+    return;
+  }
+  const liveCount = tabs.length;
+  let desiredIndex = -1;
+  if (Number.isFinite(predictedPosition) && predictedPosition >= 0) {
+    desiredIndex = Math.floor(predictedPosition * liveCount);
+  } else {
+    desiredIndex = predictedTab - 1;
+  }
+  desiredIndex = Math.max(0, Math.min(liveCount - 1, desiredIndex));
+  if (desiredIndex === lastTargetIndex) {
     return;
   }
 
   try {
-    await switchToPredictedTab(predictedTab, Number(state.tab_count || 0));
+    await switchToPredictedTab(predictedTab, predictedPosition, Number(state.tab_count || 0));
     lastSwitchAt = t;
-    lastTargetTab = predictedTab;
+    lastTargetIndex = desiredIndex;
   } catch (_err) {
     // Ignore switching errors.
   }
@@ -100,7 +122,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
   switchingEnabled = !switchingEnabled;
   if (!switchingEnabled) {
-    lastTargetTab = 0;
+    lastTargetIndex = -1;
   }
   await setUi();
 });
@@ -108,7 +130,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 chrome.action.onClicked.addListener(async () => {
   switchingEnabled = !switchingEnabled;
   if (!switchingEnabled) {
-    lastTargetTab = 0;
+    lastTargetIndex = -1;
   }
   await setUi();
 });

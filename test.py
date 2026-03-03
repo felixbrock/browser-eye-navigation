@@ -16,11 +16,16 @@ import numpy as np
 from screeninfo import get_monitors
 
 from gaze_core import EyeTracker, WEBCAM_H, WEBCAM_INDEX, WEBCAM_W
-from tab_model import (
+from model import (
     TAB_SETTINGS_FILE,
+    DEFAULT_SESSION_MAX_TABS,
+    DEFAULT_SESSION_MIN_TABS,
     chromium_tab_rectangles,
+    close_managed_chromium_session,
+    focus_managed_chromium_session,
     focus_chromium_family_window,
     is_active_chromium_family_window,
+    launch_managed_chromium_session,
     load_tab_model,
     predict_tab,
     select_chromium_tab,
@@ -125,6 +130,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-file", type=str, default=TAB_SETTINGS_FILE)
     ap.add_argument("--rounds", type=int, default=1)
+    ap.add_argument("--tabs", type=int, default=0, help="optional runtime tab count for test mapping")
     ap.add_argument("--show-status-window", action="store_true")
     ap.add_argument("--allow-any-window", action="store_true")
     ap.add_argument("--disable-browser-overlay", action="store_true")
@@ -132,24 +138,49 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.model_file):
-        raise SystemExit(f"No model at {args.model_file}. Run tab_calibration.py first.")
+        raise SystemExit(f"No model at {args.model_file}. Run calibration.py first.")
     model = load_tab_model(args.model_file)
-    tab_count = int(model.get("tab_count") or len(model.get("centers", {})))
-    if tab_count < 2:
+    model_tab_count = int(model.get("calibration_tab_count") or model.get("tab_count") or len(model.get("centers", {})))
+    if model_tab_count < 2:
         raise SystemExit("Invalid model; recalibrate first.")
-    if not args.allow_any_window and tab_count > 9:
-        raise SystemExit("Chromium test mode supports up to 9 tabs. Recalibrate with --tabs <= 9.")
+    tab_count = int(args.tabs) if int(args.tabs) >= 2 else model_tab_count
+    managed_session = None
+    if not args.allow_any_window:
+        use_overlay = not args.disable_browser_overlay
+        overlay_dir = os.path.join(os.path.dirname(__file__), "chromium_tab_overlay_extension")
+        managed_session, launch_err = launch_managed_chromium_session(
+            min_tabs=DEFAULT_SESSION_MIN_TABS,
+            max_tabs=DEFAULT_SESSION_MAX_TABS,
+            load_overlay_extension=use_overlay,
+            overlay_extension_dir=overlay_dir,
+        )
+        if launch_err is not None:
+            raise SystemExit(launch_err)
+        tab_count = int(managed_session["tab_count"])
+        print(
+            "Launched managed browser session: "
+            f"tabs={tab_count} profile={managed_session['profile_dir']}"
+        )
+        time.sleep(1.2)
 
     monitor = get_monitors()[0]
     sw = monitor.width
     if args.allow_any_window:
         _ = tab_rectangles(sw, TOP_H, tab_count)
     else:
-        ok, focus_err = focus_chromium_family_window()
+        ok, focus_err = (False, None)
+        if managed_session is not None:
+            ok, focus_err = focus_managed_chromium_session(managed_session)
         if not ok:
+            ok, focus_err = focus_chromium_family_window()
+        if not ok:
+            if managed_session is not None:
+                close_managed_chromium_session(managed_session)
             raise SystemExit(focus_err)
         _, err = chromium_tab_rectangles(sw, TOP_H, tab_count)
         if err is not None:
+            if managed_session is not None:
+                close_managed_chromium_session(managed_session)
             raise SystemExit(
                 f"{err}\nCould not auto-focus Chromium-family window. Pass --allow-any-window if needed."
             )
@@ -165,6 +196,8 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_H)
     if not cap.isOpened():
+        if managed_session is not None:
+            close_managed_chromium_session(managed_session)
         raise SystemExit("ERROR: Cannot open webcam")
     tracker = EyeTracker()
     use_browser_overlay = (not args.allow_any_window) and (not args.disable_browser_overlay)
@@ -189,6 +222,14 @@ def main():
     total = 0
     try:
         for idx, target_tab in enumerate(trial_order, start=1):
+            if overlay_publisher is not None:
+                overlay_publisher.update(
+                    enabled=True,
+                    target_tab=int(target_tab) + 1,
+                    trial_index=int(idx),
+                    trial_total=int(len(trial_order)),
+                    phase="settle",
+                )
             if not args.allow_any_window:
                 while True:
                     if is_active_chromium_family_window():
@@ -206,7 +247,21 @@ def main():
                             return
                     else:
                         time.sleep(0.05)
-                select_chromium_tab(target_tab)
+                if overlay_publisher is None:
+                    while True:
+                        if select_chromium_tab(target_tab, tab_count=tab_count):
+                            break
+                        if args.show_status_window:
+                            disp = np.zeros((160, 460, 3), dtype=np.uint8)
+                            _draw_status(disp, target_tab, None, "paused", idx, len(trial_order))
+                            cv2.imshow(win, disp)
+                            cv2.moveWindow(win, 16, 16)
+                            key = cv2.waitKey(1) & 0xFF
+                            if key in (ord("q"), 27):
+                                print("Cancelled.")
+                                return
+                        else:
+                            time.sleep(0.05)
                 time.sleep(FOCUS_SETTLE_SECONDS)
             if overlay_publisher is not None:
                 overlay_publisher.update(
@@ -260,7 +315,7 @@ def main():
                 result = tracker.process(frame, apply_head_comp=True)
                 if result is not None:
                     (h, v), _ = result
-                    pred_tab, _, _ = predict_tab(model, h, v)
+                    pred_tab, _, _ = predict_tab(model, h, v, tab_count=tab_count)
                     if pred_tab is not None:
                         votes.append(pred_tab)
 
@@ -300,6 +355,8 @@ def main():
         except cv2.error:
             pass
         cv2.destroyAllWindows()
+        if managed_session is not None:
+            close_managed_chromium_session(managed_session)
 
 
 if __name__ == "__main__":

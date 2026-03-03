@@ -1,5 +1,5 @@
 const STATE_URL = "http://127.0.0.1:8765/state";
-const POLL_MS = 500;
+const POLL_MS = 120;
 
 const MASK_TITLE = "·";
 const TARGET_TITLE = "●";
@@ -8,6 +8,7 @@ const TARGET_COLOR = "#ff2b2b";
 
 let lastEnabled = null;
 let lastActiveTabId = null;
+let lastTargetTab = 0;
 
 function isScriptableUrl(url) {
   if (!url) return false;
@@ -38,6 +39,21 @@ async function tabsInCurrentWindow() {
 async function activeTabInCurrentWindow() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs && tabs.length > 0 ? tabs[0] : null;
+}
+
+async function activateTargetTab(targetTab) {
+  const tabs = await tabsInCurrentWindow();
+  if (!tabs || tabs.length === 0) return;
+  const ordered = [...tabs].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const targetIndex = Math.max(0, Math.min(ordered.length - 1, Number(targetTab) - 1));
+  const target = ordered[targetIndex];
+  if (!target || !target.id) return;
+  if (target.active) return;
+  try {
+    await chrome.tabs.update(target.id, { active: true });
+  } catch (_err) {
+    // Ignore switching errors.
+  }
 }
 
 async function injectSetVisual(tabId, titleText, faviconUrl) {
@@ -129,20 +145,31 @@ async function applyCalibrationVisuals(enabled) {
 
 async function tick() {
   let enabled = false;
+  let targetTab = 0;
   try {
     const state = await fetchState();
     enabled = Boolean(state && state.enabled);
+    targetTab = Number(state?.target_tab || 0);
   } catch (_err) {
     enabled = false;
+    targetTab = 0;
+  }
+
+  if (enabled && targetTab >= 1) {
+    await activateTargetTab(targetTab);
   }
 
   const activeTab = await activeTabInCurrentWindow();
   const activeId = activeTab && activeTab.id ? activeTab.id : null;
-  const shouldRefresh = lastEnabled !== enabled || (enabled && activeId !== lastActiveTabId);
+  const shouldRefresh =
+    lastEnabled !== enabled ||
+    lastTargetTab !== targetTab ||
+    (enabled && activeId !== lastActiveTabId);
 
   if (shouldRefresh) {
     await applyCalibrationVisuals(enabled);
     lastEnabled = enabled;
+    lastTargetTab = targetTab;
   }
 }
 

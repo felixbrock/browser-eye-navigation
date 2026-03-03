@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+rm -f ~/.config/gaze_tab_settings.json calibration_logs/tab_calibration_*.json
