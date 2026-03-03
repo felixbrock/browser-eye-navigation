@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Tracker Switch Control",
+  "version": "1.0.0",
+  "description": "Toggle gaze-driven Chromium tab switching from tab_tracker.",
+  "permissions": ["tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "commands": {
+    "toggle-tab-switch": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      },
+      "description": "Toggle gaze-driven tab switching"
+    }
+  },
+  "action": {
+    "default_title": "Tab switch: OFF"
+  }
+}
