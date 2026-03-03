@@ -38,7 +38,18 @@ uv run python test.py --rounds 1 --tabs 20
 uv run python tracker.py
 # Optional runtime remap count for local status output:
 uv run python tracker.py --tabs 20
+# Game mode: bottom-right camera+points + red-dot target tab icon (overlay extension required):
+uv run python tracker.py --game-mode
+# In game mode, target tab icon is replaced with a red dot and restored when target advances.
+# Game mode locks to the currently active Chromium window and pauses if focus switches away.
 ```
+
+4. Train/tune from latest calibration log:
+```bash
+./train
+```
+Each run writes reasoning to `calibration_logs/train_runs/` and appends an index
+entry in `calibration_logs/train_history.md`.
 
 ## Extensions
 

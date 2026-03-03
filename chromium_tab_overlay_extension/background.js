@@ -10,6 +10,8 @@ const TARGET_COLOR = "#ff2b2b";
 let lastEnabled = null;
 let lastActiveTabId = null;
 let lastTargetTab = 0;
+let lastMarkTargetOnly = false;
+let lastBrowserHint = "";
 let tickInFlight = false;
 
 function isScriptableUrl(url) {
@@ -32,6 +34,20 @@ async function fetchState() {
     throw new Error(`state fetch failed: ${resp.status}`);
   }
   return await resp.json();
+}
+
+function browserMatchesHint(browserHint) {
+  const hint = String(browserHint || "").toLowerCase();
+  if (!hint) return true;
+  const ua = String(self.navigator?.userAgent || "");
+  const isBrave = /\bBrave\//i.test(ua);
+  if (hint === "google-chrome") {
+    return !isBrave;
+  }
+  if (hint === "brave") {
+    return isBrave;
+  }
+  return true;
 }
 
 async function tabsInCurrentWindow() {
@@ -118,6 +134,10 @@ async function injectRestore(tabId) {
 }
 
 async function applyCalibrationVisuals(enabled) {
+  return await applyVisuals(enabled, 0, false);
+}
+
+async function applyVisuals(enabled, targetTab, markTargetOnly) {
   const allTabs = await tabsInCurrentWindow();
   const activeTab = await activeTabInCurrentWindow();
   const activeId = activeTab && activeTab.id ? activeTab.id : null;
@@ -133,13 +153,25 @@ async function applyCalibrationVisuals(enabled) {
 
   const maskIcon = dotSvgDataUrl(MASK_COLOR);
   const targetIcon = dotSvgDataUrl(TARGET_COLOR);
+  const ordered = [...allTabs].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const targetIndex = Math.max(0, Math.min(ordered.length - 1, Number(targetTab) - 1));
+  const targetTabId = targetTab >= 1 && ordered[targetIndex] ? ordered[targetIndex].id : null;
 
   for (const tab of allTabs) {
     if (!tab.id || !isScriptableUrl(tab.url)) continue;
-    const isActive = activeId !== null && tab.id === activeId;
-    const title = isActive ? TARGET_TITLE : MASK_TITLE;
-    const icon = isActive ? targetIcon : maskIcon;
-    await injectSetVisual(tab.id, title, icon);
+    if (markTargetOnly) {
+      const isTarget = targetTabId !== null && tab.id === targetTabId;
+      if (isTarget) {
+        await injectSetVisual(tab.id, TARGET_TITLE, targetIcon);
+      } else {
+        await injectRestore(tab.id);
+      }
+    } else {
+      const isActive = activeId !== null && tab.id === activeId;
+      const title = isActive ? TARGET_TITLE : MASK_TITLE;
+      const icon = isActive ? targetIcon : maskIcon;
+      await injectSetVisual(tab.id, title, icon);
+    }
   }
 
   lastActiveTabId = activeId;
@@ -152,6 +184,9 @@ async function tick() {
   tickInFlight = true;
   let enabled = false;
   let targetTab = 0;
+  let autoActivate = true;
+  let markTargetOnly = false;
+  let browserHint = "";
   try {
     try {
       const state = await fetchState();
@@ -159,13 +194,24 @@ async function tick() {
       if (state && state.enabled && ageMs <= STATE_STALE_MS) {
         enabled = true;
         targetTab = Number(state?.target_tab || 0);
+        autoActivate = state?.auto_activate !== false;
+        markTargetOnly = state?.mark_target_only === true;
+        browserHint = String(state?.browser_hint || "");
       }
     } catch (_err) {
       enabled = false;
       targetTab = 0;
+      autoActivate = true;
+      markTargetOnly = false;
+      browserHint = "";
     }
 
-    if (enabled && targetTab >= 1) {
+    if (!browserMatchesHint(browserHint)) {
+      enabled = false;
+      targetTab = 0;
+    }
+
+    if (enabled && targetTab >= 1 && autoActivate) {
       await activateTargetTab(targetTab);
     }
 
@@ -174,12 +220,16 @@ async function tick() {
     const shouldRefresh =
       lastEnabled !== enabled ||
       lastTargetTab !== targetTab ||
+      lastMarkTargetOnly !== markTargetOnly ||
+      lastBrowserHint !== browserHint ||
       (enabled && activeId !== lastActiveTabId);
 
     if (shouldRefresh) {
-      await applyCalibrationVisuals(enabled);
+      await applyVisuals(enabled, targetTab, markTargetOnly);
       lastEnabled = enabled;
       lastTargetTab = targetTab;
+      lastMarkTargetOnly = markTargetOnly;
+      lastBrowserHint = browserHint;
     }
   } finally {
     tickInFlight = false;
