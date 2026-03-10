@@ -1,0 +1,13 @@
+[project]
+name = "browser-eye-navigation"
+version = "0.1.0"
+description = "Collect browser tab click training data with webcam eye/head features."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mediapipe>=0.10.32",
+    "numpy>=2.4.2",
+    "opencv-python>=4.13.0.92",
+    "pynput>=1.7.7",
+    "screeninfo>=0.8.1",
+]

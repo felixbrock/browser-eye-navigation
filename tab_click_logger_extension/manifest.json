@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Tab Click Logger",
+  "version": "1.0.0",
+  "description": "Send Brave/Chrome tab activation metadata to the local training-data collector.",
+  "permissions": ["tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:8767/*",
+    "http://localhost:8767/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
