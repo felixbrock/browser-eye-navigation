@@ -1,0 +1,42 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Coverage and test outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+
+# Local logs and runtime files
+*.log
+
+# Project-generated calibration and training outputs
+calibration_logs/*.json
+calibration_logs/train_runs/
+
+# Editors and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
