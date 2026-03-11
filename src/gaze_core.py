@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -14,7 +14,9 @@ import numpy as np
 WEBCAM_INDEX = 0
 WEBCAM_W = 640
 WEBCAM_H = 480
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+SRC_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SRC_DIR.parent
+MODEL_PATH = PROJECT_ROOT / "models" / "face_landmarker.task"
 
 R_OUTER = 33
 R_INNER = 133
@@ -42,7 +44,7 @@ class EyeTracker:
     """Extract webcam eye and head features using MediaPipe Face Landmarker."""
 
     def __init__(self) -> None:
-        if not os.path.exists(MODEL_PATH):
+        if not MODEL_PATH.exists():
             print(f"ERROR: Model not found at {MODEL_PATH}")
             print("Download it with:")
             print(
@@ -53,7 +55,7 @@ class EyeTracker:
             sys.exit(1)
 
         options = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
             num_faces=1,
             min_face_detection_confidence=0.5,

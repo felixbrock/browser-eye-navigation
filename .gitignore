@@ -34,6 +34,9 @@ site/
 # Project-generated calibration and training outputs
 calibration_logs/*.json
 calibration_logs/train_runs/
+models/*.metrics.json
+models/*.metadata.json
+models/*.pkl
 
 # Editors and OS metadata
 .DS_Store

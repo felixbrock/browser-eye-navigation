@@ -14,6 +14,7 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import cv2
 from pynput import mouse
@@ -25,10 +26,75 @@ CHROMIUM_TOKENS = ("brave", "chrome", "chromium")
 TAB_STRIP_MAX_Y = 140
 CLICK_MATCH_MAX_AGE_MS = 1200
 EVENT_BACKLOOK_MS = 1200
+SRC_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SRC_DIR.parent
+DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "train.jsonl"
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def sanitize_tab_strip(tab_strip):
+    if not isinstance(tab_strip, dict):
+        return None
+    return {
+        "left_px": _as_float(tab_strip.get("left_px")),
+        "right_px": _as_float(tab_strip.get("right_px")),
+        "width_px": _as_float(tab_strip.get("width_px")),
+        "height_px": _as_float(tab_strip.get("height_px")),
+        "right_inset_px": _as_float(tab_strip.get("right_inset_px")),
+    }
+
+
+def sanitize_tab_candidates(candidates):
+    if not isinstance(candidates, list):
+        return []
+
+    sanitized = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        bounds_px = candidate.get("bounds_px") if isinstance(candidate.get("bounds_px"), dict) else {}
+        bounds_norm = candidate.get("bounds_norm") if isinstance(candidate.get("bounds_norm"), dict) else {}
+        sanitized.append(
+            {
+                "tab_id": _as_int(candidate.get("tab_id")),
+                "index": _as_int(candidate.get("index")),
+                "title": str(candidate.get("title") or ""),
+                "is_active": bool(candidate.get("is_active", False)),
+                "is_pinned": bool(candidate.get("is_pinned", False)),
+                "bounds_px": {
+                    "left": _as_float(bounds_px.get("left")),
+                    "right": _as_float(bounds_px.get("right")),
+                    "center": _as_float(bounds_px.get("center")),
+                    "width": _as_float(bounds_px.get("width")),
+                    "top": _as_float(bounds_px.get("top")),
+                    "height": _as_float(bounds_px.get("height")),
+                },
+                "bounds_norm": {
+                    "left": _as_float(bounds_norm.get("left")),
+                    "right": _as_float(bounds_norm.get("right")),
+                    "center": _as_float(bounds_norm.get("center")),
+                    "width": _as_float(bounds_norm.get("width")),
+                },
+            }
+        )
+    return sanitized
 
 
 def run_command(args):
@@ -234,6 +300,8 @@ class DataCollector:
         face_samples = sum(1 for sample in samples if sample.get("face_detected"))
         window = click.get("window") or {}
         monitor = click.get("monitor") or {}
+        tab_strip = sanitize_tab_strip(event.get("tab_strip"))
+        tab_candidates = sanitize_tab_candidates(event.get("tab_candidates"))
 
         entry = {
             "timestamp": ts_ms / 1000.0,
@@ -248,7 +316,10 @@ class DataCollector:
                 "tab_id": event.get("tab_id"),
                 "clicked_tab_index": event.get("tab_index"),
                 "tab_count": event.get("tab_count"),
+                "clicked_tab_title": event.get("tab_title"),
             },
+            "tab_strip": tab_strip,
+            "tab_candidates": tab_candidates,
             "monitor": {
                 "x": monitor.get("x"),
                 "y": monitor.get("y"),
@@ -337,7 +408,7 @@ class DataCollector:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera-index", type=int, default=WEBCAM_INDEX)
-    parser.add_argument("--output-path", default="./train/train.jsonl")
+    parser.add_argument("--output-path", default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument("--port", type=int, default=8767)
     parser.add_argument("--buffer-ms", type=int, default=800)
     return parser.parse_args()
