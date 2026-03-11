@@ -17,7 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
+import numpy as np
 from pynput import mouse
+from PIL import ImageGrab
 from screeninfo import get_monitors
 
 from gaze_core import EyeTracker, WEBCAM_H, WEBCAM_INDEX, WEBCAM_W
@@ -26,6 +28,11 @@ CHROMIUM_TOKENS = ("brave", "chrome", "chromium")
 TAB_STRIP_MAX_Y = 140
 CLICK_MATCH_MAX_AGE_MS = 1200
 EVENT_BACKLOOK_MS = 1200
+DEFAULT_TAB_STRIP_LEFT_INSET_PX = 32.0
+DEFAULT_TAB_STRIP_RIGHT_INSET_PX = 132.0
+DEFAULT_TAB_STRIP_HEIGHT_PX = 36.0
+PINNED_TAB_WIDTH_PX = 44.0
+STRIP_CAPTURE_HEIGHT_PX = 52
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "train.jsonl"
@@ -95,6 +102,267 @@ def sanitize_tab_candidates(candidates):
             }
         )
     return sanitized
+
+
+def browser_hint_for_window(window, fallback_hint):
+    text = f"{window.get('class') or ''} {window.get('title') or ''}".lower()
+    if "brave" in text:
+        return "brave"
+    if "google-chrome" in text or "google chrome" in text:
+        return "google-chrome"
+    if "chrome" in text:
+        return "google-chrome"
+    if "chromium" in text:
+        return "chromium"
+    return fallback_hint
+
+
+def _normalize_strip(strip, window_width: float):
+    hint = sanitize_tab_strip(strip)
+    if hint is None:
+        right_inset = DEFAULT_TAB_STRIP_RIGHT_INSET_PX
+        width = max(1.0, window_width - DEFAULT_TAB_STRIP_LEFT_INSET_PX - right_inset)
+        return {
+            "left_px": DEFAULT_TAB_STRIP_LEFT_INSET_PX,
+            "right_px": DEFAULT_TAB_STRIP_LEFT_INSET_PX + width,
+            "width_px": width,
+            "height_px": DEFAULT_TAB_STRIP_HEIGHT_PX,
+            "right_inset_px": right_inset,
+        }
+
+    left = _as_float(hint.get("left_px")) or DEFAULT_TAB_STRIP_LEFT_INSET_PX
+    right = _as_float(hint.get("right_px"))
+    width = _as_float(hint.get("width_px"))
+    if right is None and width is not None:
+        right = left + width
+    if right is None:
+        right = max(left + 1.0, window_width - DEFAULT_TAB_STRIP_RIGHT_INSET_PX)
+    right = min(max(right, left + 1.0), window_width)
+    width = max(1.0, right - left)
+    return {
+        "left_px": left,
+        "right_px": right,
+        "width_px": width,
+        "height_px": _as_float(hint.get("height_px")) or DEFAULT_TAB_STRIP_HEIGHT_PX,
+        "right_inset_px": max(0.0, window_width - right),
+    }
+
+
+def _default_source_candidates(event):
+    tab_count = max(1, _as_int(event.get("tab_count")) or 1)
+    clicked_index = _as_int(event.get("tab_index")) or 0
+    clicked_title = str(event.get("tab_title") or "")
+    clicked_tab_id = _as_int(event.get("tab_id"))
+    return [
+        {
+            "tab_id": clicked_tab_id if index == clicked_index else index,
+            "index": index,
+            "title": clicked_title if index == clicked_index else "",
+            "is_active": index == clicked_index,
+            "is_pinned": False,
+            "bounds_px": {"left": None, "right": None, "center": None, "width": None, "top": 0.0, "height": DEFAULT_TAB_STRIP_HEIGHT_PX},
+            "bounds_norm": {"left": None, "right": None, "center": None, "width": None},
+        }
+        for index in range(tab_count)
+    ]
+
+
+def capture_strip_image(window):
+    if not window:
+        return None
+    width = _as_int(window.get("width"))
+    height = _as_int(window.get("height"))
+    x = _as_int(window.get("x"))
+    y = _as_int(window.get("y"))
+    if None in (width, height, x, y) or width <= 0 or height <= 0:
+        return None
+    bbox = (x, y, x + width, y + min(height, TAB_STRIP_MAX_Y))
+    try:
+        image = ImageGrab.grab(bbox=bbox)
+    except Exception:
+        return None
+    if image is None:
+        return None
+    return np.asarray(image.convert("RGB"))
+
+
+def detect_strip_bounds_from_image(image, hint_strip, window_width: float):
+    strip = dict(hint_strip)
+    if image is None or image.size == 0:
+        return strip, False
+
+    gray = cv2.cvtColor(image[: min(image.shape[0], STRIP_CAPTURE_HEIGHT_PX)], cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 32, 96)
+    col_energy = edges.mean(axis=0).astype(np.float32)
+    if not len(col_energy):
+        return strip, False
+
+    smooth = np.convolve(col_energy, np.ones(17, dtype=np.float32) / 17.0, mode="same")
+    threshold = max(2.0, float(np.percentile(smooth, 65)))
+    active = np.flatnonzero(smooth >= threshold)
+    if len(active) < 8:
+        return strip, False
+
+    detected_left = max(0.0, float(active[0]) - 4.0)
+    detected_right = min(window_width, float(active[-1]) + 4.0)
+
+    if detected_right - detected_left < 200.0:
+        return strip, False
+
+    hint_left = _as_float(strip.get("left_px")) or DEFAULT_TAB_STRIP_LEFT_INSET_PX
+    hint_right = _as_float(strip.get("right_px")) or max(hint_left + 1.0, window_width - DEFAULT_TAB_STRIP_RIGHT_INSET_PX)
+
+    strip["left_px"] = max(0.0, min(hint_left, detected_left + 24.0))
+    strip["right_px"] = min(window_width, max(hint_right, detected_right - 40.0))
+    strip["width_px"] = max(1.0, strip["right_px"] - strip["left_px"])
+    strip["right_inset_px"] = max(0.0, window_width - strip["right_px"])
+    return strip, True
+
+
+def build_candidates_from_strip(source_candidates, strip):
+    candidates = []
+    ordered = sorted(source_candidates, key=lambda item: (_as_int(item.get("index")) or 0, _as_int(item.get("tab_id")) or 0))
+    pinned_count = sum(1 for candidate in ordered if candidate.get("is_pinned"))
+    normal_count = max(0, len(ordered) - pinned_count)
+    strip_left = _as_float(strip.get("left_px")) or DEFAULT_TAB_STRIP_LEFT_INSET_PX
+    strip_width = max(1.0, _as_float(strip.get("width_px")) or 1.0)
+    strip_height = _as_float(strip.get("height_px")) or DEFAULT_TAB_STRIP_HEIGHT_PX
+    pinned_width = PINNED_TAB_WIDTH_PX if pinned_count else 0.0
+    normal_width = (
+        max(1.0, (strip_width - (pinned_count * pinned_width)) / normal_count)
+        if normal_count
+        else 0.0
+    )
+
+    cursor = strip_left
+    for candidate in ordered:
+        width = pinned_width if candidate.get("is_pinned") else normal_width
+        width = max(1.0, width)
+        left = cursor
+        right = left + width
+        center = left + (width * 0.5)
+        cursor = right
+        candidates.append(
+            {
+                "tab_id": _as_int(candidate.get("tab_id")),
+                "index": _as_int(candidate.get("index")),
+                "title": str(candidate.get("title") or ""),
+                "is_active": bool(candidate.get("is_active", False)),
+                "is_pinned": bool(candidate.get("is_pinned", False)),
+                "bounds_px": {
+                    "left": float(left),
+                    "right": float(right),
+                    "center": float(center),
+                    "width": float(width),
+                    "top": 0.0,
+                    "height": float(strip_height),
+                },
+                "bounds_norm": {
+                    "left": float((left - strip_left) / strip_width),
+                    "right": float((right - strip_left) / strip_width),
+                    "center": float((center - strip_left) / strip_width),
+                    "width": float(width / strip_width),
+                },
+            }
+        )
+    return candidates
+
+
+def shift_layout(candidates, strip, shift_px):
+    if not candidates or abs(shift_px) < 1e-3:
+        return candidates, strip, 0.0
+
+    min_shift = -min(candidate["bounds_px"]["left"] for candidate in candidates)
+    max_shift = _as_float(strip.get("right_inset_px"))
+    if max_shift is None:
+        max_shift = 0.0
+    applied = float(np.clip(shift_px, min_shift, max_shift))
+
+    shifted = []
+    for candidate in candidates:
+        bounds_px = dict(candidate["bounds_px"])
+        bounds_px["left"] += applied
+        bounds_px["right"] += applied
+        bounds_px["center"] += applied
+        shifted.append({**candidate, "bounds_px": bounds_px, "bounds_norm": dict(candidate["bounds_norm"])})
+
+    shifted_strip = dict(strip)
+    shifted_strip["left_px"] = (_as_float(strip.get("left_px")) or 0.0) + applied
+    shifted_strip["right_px"] = (_as_float(strip.get("right_px")) or 0.0) + applied
+    shifted_strip["width_px"] = max(1.0, shifted_strip["right_px"] - shifted_strip["left_px"])
+    shifted_strip["right_inset_px"] = max(0.0, shifted_strip["right_inset_px"] - applied if strip.get("right_inset_px") is not None else 0.0)
+
+    strip_left = shifted_strip["left_px"]
+    strip_width = max(1.0, shifted_strip["width_px"])
+    for candidate in shifted:
+        bounds_px = candidate["bounds_px"]
+        candidate["bounds_norm"] = {
+            "left": float((bounds_px["left"] - strip_left) / strip_width),
+            "right": float((bounds_px["right"] - strip_left) / strip_width),
+            "center": float((bounds_px["center"] - strip_left) / strip_width),
+            "width": float(bounds_px["width"] / strip_width),
+        }
+    return shifted, shifted_strip, applied
+
+
+def compute_geometry_metrics(candidates, clicked_index, click_window_x):
+    clicked_candidate = next((candidate for candidate in candidates if candidate.get("index") == clicked_index), None)
+    nearest_candidate = None
+    if candidates:
+        nearest_candidate = min(
+            candidates,
+            key=lambda candidate: abs(click_window_x - (candidate["bounds_px"]["center"] or 0.0)),
+        )
+
+    if clicked_candidate is None:
+        return {
+            "click_window_x": click_window_x,
+            "click_inside_reported_tab": False,
+            "nearest_tab_index": nearest_candidate.get("index") if nearest_candidate else None,
+            "click_offset_px": None,
+        }
+
+    bounds = clicked_candidate["bounds_px"]
+    inside = bool(bounds["left"] <= click_window_x <= bounds["right"])
+    return {
+        "click_window_x": click_window_x,
+        "click_inside_reported_tab": inside,
+        "nearest_tab_index": nearest_candidate.get("index") if nearest_candidate else None,
+        "click_offset_px": float(click_window_x - bounds["center"]),
+    }
+
+
+def build_collector_layout(window, click, event, source_candidates, source_strip):
+    window_width = float(_as_float(window.get("width")) or 1.0)
+    strip = _normalize_strip(source_strip, window_width)
+    screen_capture = capture_strip_image(window)
+    strip, measured_from_image = detect_strip_bounds_from_image(screen_capture, strip, window_width)
+    candidates = build_candidates_from_strip(source_candidates, strip)
+
+    clicked_index = _as_int(event.get("tab_index"))
+    click_window_x = float((_as_int(click.get("desktop_x")) or 0) - (_as_int(window.get("x")) or 0))
+    geometry_source = "measured" if measured_from_image else "extension"
+    alignment_shift_px = 0.0
+
+    if candidates and clicked_index is not None:
+        clicked_candidate = next((candidate for candidate in candidates if candidate.get("index") == clicked_index), None)
+        if clicked_candidate is not None:
+            left = clicked_candidate["bounds_px"]["left"]
+            right = clicked_candidate["bounds_px"]["right"]
+            if not (left <= click_window_x <= right):
+                alignment_shift = click_window_x - clicked_candidate["bounds_px"]["center"]
+                candidates, strip, alignment_shift_px = shift_layout(candidates, strip, alignment_shift)
+
+    geometry = compute_geometry_metrics(candidates, clicked_index, click_window_x)
+    geometry.update(
+        {
+            "source": geometry_source,
+            "screen_capture_succeeded": bool(screen_capture is not None),
+            "image_measurement_succeeded": bool(measured_from_image),
+            "alignment_shift_px": float(alignment_shift_px),
+        }
+    )
+    return strip, candidates, geometry
 
 
 def run_command(args):
@@ -300,13 +568,21 @@ class DataCollector:
         face_samples = sum(1 for sample in samples if sample.get("face_detected"))
         window = click.get("window") or {}
         monitor = click.get("monitor") or {}
-        tab_strip = sanitize_tab_strip(event.get("tab_strip"))
-        tab_candidates = sanitize_tab_candidates(event.get("tab_candidates"))
+        source_tab_strip = sanitize_tab_strip(event.get("tab_strip"))
+        source_tab_candidates = sanitize_tab_candidates(event.get("tab_candidates")) or _default_source_candidates(event)
+        tab_strip, tab_candidates, geometry = build_collector_layout(
+            window,
+            click,
+            event,
+            source_tab_candidates,
+            source_tab_strip,
+        )
+        browser_hint = browser_hint_for_window(window, event.get("browser_hint"))
 
         entry = {
             "timestamp": ts_ms / 1000.0,
             "timestamp_ms": ts_ms,
-            "browser_hint": event.get("browser_hint"),
+            "browser_hint": browser_hint,
             "browser_window_id": {
                 "chrome_window_id": event.get("chrome_window_id"),
                 "x11_window_id": window.get("x11_window_id"),
@@ -320,6 +596,7 @@ class DataCollector:
             },
             "tab_strip": tab_strip,
             "tab_candidates": tab_candidates,
+            "geometry": geometry,
             "monitor": {
                 "x": monitor.get("x"),
                 "y": monitor.get("y"),
@@ -348,6 +625,8 @@ class DataCollector:
                 "face_sample_count": face_samples,
                 "face_detected_recently": face_samples > 0,
                 "top_strip_click": bool(click.get("click_y") is not None and click["click_y"] <= TAB_STRIP_MAX_Y),
+                "geometry_source": geometry.get("source"),
+                "geometry_click_inside_reported_tab": geometry.get("click_inside_reported_tab"),
             },
             "pre_click_samples": samples,
         }

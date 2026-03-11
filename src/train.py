@@ -44,6 +44,16 @@ def parse_args():
         default=5,
         help="Skip events with fewer recent face-detected samples than this threshold.",
     )
+    parser.add_argument(
+        "--allow-unmeasured-geometry",
+        action="store_true",
+        help="Include rows whose candidate layout did not come from collector-side measurement.",
+    )
+    parser.add_argument(
+        "--allow-suspect-geometry",
+        action="store_true",
+        help="Include rows where the recorded click does not land inside the reported clicked tab bounds.",
+    )
     return parser.parse_args()
 
 
@@ -300,15 +310,40 @@ def entry_to_examples(entry, min_face_samples: int):
     return examples
 
 
-def build_dataset(entries, min_face_samples: int):
+def geometry_is_usable(entry, allow_unmeasured_geometry: bool, allow_suspect_geometry: bool):
+    geometry = entry.get("geometry") or {}
+    source = geometry.get("source")
+    click_inside = geometry.get("click_inside_reported_tab")
+
+    if not allow_unmeasured_geometry and source not in {"measured"}:
+        return False, "unmeasured_geometry"
+    if not allow_suspect_geometry and click_inside is False:
+        return False, "suspect_geometry"
+    return True, None
+
+
+def build_dataset(entries, min_face_samples: int, allow_unmeasured_geometry: bool, allow_suspect_geometry: bool):
     examples = []
     skipped_events = 0
     legacy_events = 0
+    skipped_by_reason = defaultdict(int)
+    geometry_source_counts = defaultdict(int)
 
     for entry in entries:
+        geometry = entry.get("geometry") or {}
+        if geometry.get("source") is not None:
+            geometry_source_counts[str(geometry.get("source"))] += 1
+
+        usable, reason = geometry_is_usable(entry, allow_unmeasured_geometry, allow_suspect_geometry)
+        if not usable:
+            skipped_events += 1
+            skipped_by_reason[reason] += 1
+            continue
+
         event_examples = entry_to_examples(entry, min_face_samples)
         if not event_examples:
             skipped_events += 1
+            skipped_by_reason["insufficient_face_samples"] += 1
             continue
         examples.extend(event_examples)
         legacy_events += int(event_examples[0]["used_legacy_layout"])
@@ -335,6 +370,8 @@ def build_dataset(entries, min_face_samples: int):
         "num_examples": len(examples),
         "skipped_events": skipped_events,
         "legacy_events": legacy_events,
+        "skipped_by_reason": dict(skipped_by_reason),
+        "geometry_source_counts": dict(geometry_source_counts),
     }
 
 
@@ -431,6 +468,8 @@ def save_artifacts(output_dir: Path, model_name: str, model, feature_names, data
         "num_events": dataset["num_events"],
         "legacy_events": dataset["legacy_events"],
         "skipped_events": dataset["skipped_events"],
+        "skipped_by_reason": dataset["skipped_by_reason"],
+        "geometry_source_counts": dataset["geometry_source_counts"],
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
@@ -442,7 +481,12 @@ def main():
     input_path = Path(args.input_path).resolve()
     output_dir = Path(args.output_dir).resolve()
     entries = load_entries(input_path)
-    dataset = build_dataset(entries, min_face_samples=args.min_face_samples)
+    dataset = build_dataset(
+        entries,
+        min_face_samples=args.min_face_samples,
+        allow_unmeasured_geometry=args.allow_unmeasured_geometry,
+        allow_suspect_geometry=args.allow_suspect_geometry,
+    )
     train_events, test_events = split_events(
         dataset["event_ids"],
         test_size=args.test_size,
@@ -468,6 +512,8 @@ def main():
             "num_events": dataset["num_events"],
             "legacy_events": dataset["legacy_events"],
             "skipped_events": dataset["skipped_events"],
+            "skipped_by_reason": dataset["skipped_by_reason"],
+            "geometry_source_counts": dataset["geometry_source_counts"],
         }
     )
 

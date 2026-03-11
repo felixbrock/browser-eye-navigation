@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Tab Runtime Control",
+  "version": "1.0.0",
+  "description": "Report focused browser tab state to the local runtime and activate returned tabs.",
+  "permissions": ["tabs", "offscreen", "scripting", "storage"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8768/*",
+    "http://localhost:8768/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["runtime_hotkey.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["offscreen.html", "offscreen.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
